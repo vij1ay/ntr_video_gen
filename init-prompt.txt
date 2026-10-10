@@ -1,0 +1,1615 @@
+You are the lead software architect and implementation engineer for this project.
+
+You are working inside a local development environment and must build a production-quality
+local-first Nature Video Automation application.
+
+The application is NOT a web SaaS application and must NOT depend on cloud AI services.
+
+The primary purpose is:
+
+    Natural-language/script input
+        ↓
+    Local LLM
+        ↓
+    Video concept + scene plan
+        ↓
+    ComfyUI
+        ↓
+    Nature images / short video clips
+        ↓
+    Local AI music generation
+        ↓
+    FFmpeg composition
+        ↓
+    Final YouTube-ready video package
+        ↓
+    One self-contained output folder
+
+A separate YouTube uploader script will later consume one of these output folders and upload
+the complete package to YouTube.
+
+============================================================
+1. CORE PRODUCT GOAL
+============================================================
+
+Build a local video automation tool for creating relaxing nature videos.
+
+Initial content focus:
+
+- Nature
+- Mountains
+- Trees
+- Forests
+- Grasslands
+- Rivers
+- Lakes
+- Oceans
+- Beaches
+- Waterfalls
+- Rain
+- Snow
+- Clouds
+- Sunsets
+- Sunrises
+- Wildlife
+- Birds
+- Deer
+- Horses
+- Other peaceful animals
+- Countryside
+- Meadows
+- Natural landscapes
+- Seasonal nature
+- Mist and fog
+- Night nature
+- Stars
+- Fireflies
+- Caves
+- Streams
+- Rocks
+- Tropical environments
+- Alpine environments
+
+The architecture must NOT hard-code the application to nature.
+
+The underlying engine should support future categories such as:
+
+- Travel
+- Meditation
+- Sleep
+- Ambient
+- Educational
+- History
+- Documentary
+- Philosophy
+- Technology
+
+Nature is the first content template.
+
+============================================================
+2. IMPORTANT PRODUCT PRINCIPLES
+============================================================
+
+The application should prioritize:
+
+1. Local execution
+2. Reproducibility
+3. Modular AI providers
+4. Good generated videos over unnecessary complexity
+5. Long relaxing videos made from shorter scenes
+6. Seamless audio
+7. YouTube-ready output
+8. Easy debugging
+9. Ability to replace AI models later
+10. No hard dependency on a single model
+
+Do NOT build unnecessary distributed infrastructure.
+
+Do NOT introduce Kubernetes, Kafka, Redis, Celery, cloud queues, databases requiring
+external services, or microservices unless there is a strong implementation reason.
+
+This is initially a local scripting application.
+
+Keep the architecture simple.
+
+============================================================
+3. EXECUTION MODEL
+============================================================
+
+The application should primarily be script/CLI driven.
+
+The main command should conceptually look like:
+
+    python -m app generate --input input.txt
+
+or:
+
+    python -m app generate --prompt "A peaceful rainy mountain forest"
+
+Support both:
+
+    --input <file>
+
+and:
+
+    --prompt "<text>"
+
+The user should eventually be able to provide a structured JSON/YAML project definition too.
+
+Example:
+
+    python -m app generate --input projects/rainy_alps.yaml
+
+The application must create one output directory for every generated video.
+
+Example:
+
+    output/
+        rainy_alps_20261006_143000/
+
+            video.mp4
+            thumbnail.jpg
+
+            youtube/
+                title.txt
+                description.txt
+                tags.txt
+                category.txt
+                language.txt
+                metadata.json
+
+            project/
+                project.json
+                scene_plan.json
+
+            scenes/
+                scene_001/
+                scene_002/
+                scene_003/
+
+            audio/
+                music.wav
+                ambient.wav
+                final_audio.wav
+
+            logs/
+                generation.log
+
+The exact directory structure can be improved during implementation, but the principle is mandatory:
+
+ONE VIDEO = ONE SELF-CONTAINED OUTPUT DIRECTORY.
+
+That folder must contain everything required by a future YouTube uploader.
+
+============================================================
+4. YOUTUBE UPLOADER
+============================================================
+
+DO NOT implement YouTube API publishing as part of the main generator.
+
+Instead, create a separate future-compatible uploader script.
+
+For example:
+
+    scripts/youtube_upload.py
+
+It should eventually accept:
+
+    python scripts/youtube_upload.py output/rainy_alps_20261006_143000/
+
+The uploader should be completely independent from video generation.
+
+The generator must therefore produce all YouTube metadata required by the uploader.
+
+At minimum generate:
+
+    title
+    description
+    tags
+    category
+    language
+    privacy suggestion
+    filename
+    thumbnail
+    video file
+
+Store metadata in:
+
+    youtube/metadata.json
+
+Example:
+
+{
+    "title": "...",
+    "description": "...",
+    "tags": [],
+    "category": "Entertainment",
+    "language": "en",
+    "privacy": "private",
+    "thumbnail": "thumbnail.jpg",
+    "video": "video.mp4"
+}
+
+The uploader should later be able to read this file without needing to understand the
+video-generation internals.
+
+============================================================
+5. INPUT
+============================================================
+
+The user should be able to provide a simple natural-language idea.
+
+Example:
+
+    "Create a peaceful rainy mountain video with forests, rivers and deer."
+
+The local LLM should turn this into a structured project.
+
+The LLM must determine:
+
+- video concept
+- overall mood
+- visual style
+- scene count
+- scene descriptions
+- scene duration
+- visual prompts
+- camera movement
+- transitions
+- music mood
+- ambient sound suggestions
+- YouTube title
+- YouTube description
+- tags
+- thumbnail concept
+
+Do not make the user manually specify every scene.
+
+The LLM is the creative director.
+
+============================================================
+6. VIDEO LENGTH
+============================================================
+
+Video length must be configurable from the command line/configuration.
+
+Default:
+
+    15 minutes
+
+Example:
+
+    --duration 15m
+
+Support:
+
+    5m
+    10m
+    15m
+    20m
+    30m
+    45m
+    60m
+
+Also support arbitrary duration where practical:
+
+    --duration 27m
+
+or:
+
+    --duration 90s
+
+Do not require the user to specify duration.
+
+Default must always be:
+
+    15 minutes
+
+The LLM should plan scenes to fill the requested duration.
+
+IMPORTANT:
+
+Do NOT attempt to generate one continuous 15-minute AI video.
+
+Instead use multiple scenes and composition techniques.
+
+For example:
+
+    10-30 second generated clips
+    +
+    generated still images
+    +
+    slow camera movement
+    +
+    looping where appropriate
+    +
+    speed adjustment
+    +
+    crossfades
+    +
+    transitions
+
+to produce the final long-form video.
+
+============================================================
+7. VIDEO RESOLUTION
+============================================================
+
+Default:
+
+    1920x1080
+
+This is the standard YouTube landscape format.
+
+Do NOT allow arbitrary width/height combinations.
+
+Only allow predefined standard aspect-ratio presets.
+
+Initial presets:
+
+    1920x1080    16:9    landscape
+    1280x720     16:9    landscape
+    3840x2160    16:9    4K landscape
+
+    1080x1920    9:16    vertical
+    720x1280     9:16    vertical
+
+    1080x1080    1:1     square
+
+    1440x1080    4:3     legacy landscape
+
+The default must be:
+
+    1920x1080
+
+Do not allow arbitrary aspect ratios through the normal CLI.
+
+Make resolution presets configurable in one central configuration file.
+
+============================================================
+8. LOCAL LLM
+============================================================
+
+The user is running local models through LM Studio.
+
+The currently available models are:
+
+    qwen/qwen3.8-27b
+
+and:
+
+    prism-ml/bonsai-27b
+
+The application must communicate with LM Studio through its OpenAI-compatible local API.
+
+Do NOT embed the LLM directly into the application.
+
+Do NOT assume a specific model.
+
+Implement an LLM provider abstraction.
+
+Example conceptual interface:
+
+    LLMProvider
+        generate()
+        generate_json()
+        health_check()
+
+Initial implementation:
+
+    LMStudioProvider
+
+Configuration should be externalized.
+
+Example:
+
+    LM_STUDIO_BASE_URL=http://localhost:1234/v1
+    LM_STUDIO_API_KEY=lm-studio
+    LM_STUDIO_MODEL=qwen/qwen3.8-27b
+
+Allow the model to be changed without changing code.
+
+For example:
+
+    LM_STUDIO_MODEL=prism-ml/bonsai-27b
+
+The application should support:
+
+    --model qwen/qwen3.8-27b
+
+or:
+
+    --model prism-ml/bonsai-27b
+
+if practical.
+
+Do not hard-code model-specific behavior.
+
+============================================================
+9. LLM OUTPUT
+============================================================
+
+The LLM MUST return structured JSON when generating the project plan.
+
+Do not rely on parsing free-form prose.
+
+Define a validated Pydantic model or equivalent schema.
+
+Conceptually:
+
+ProjectPlan:
+
+    project_id
+    title
+    concept
+    duration_seconds
+    resolution
+    aspect_ratio
+    visual_style
+    mood
+    scenes[]
+    music_plan
+    ambient_audio_plan
+    youtube_metadata
+    thumbnail_plan
+
+Scene:
+
+    id
+    title
+    duration_seconds
+    description
+    visual_prompt
+    negative_prompt
+    camera_motion
+    transition
+    generation_type
+    ambience
+    intensity
+
+generation_type should support at least:
+
+    image
+    video
+    hybrid
+
+Example:
+
+{
+    "id": "scene_001",
+    "title": "Misty Alpine Valley",
+    "duration_seconds": 45,
+    "description": "A peaceful alpine valley covered in morning mist.",
+    "visual_prompt": "...",
+    "negative_prompt": "...",
+    "camera_motion": "very slow forward movement",
+    "transition": "crossfade",
+    "generation_type": "video",
+    "ambience": ["wind", "distant_rain"],
+    "intensity": "very_low"
+}
+
+============================================================
+10. SCENE DESIGN
+============================================================
+
+Relaxing videos should not change scenes too rapidly.
+
+The LLM should select scene durations appropriate for the requested video.
+
+For a 15-minute video, approximately:
+
+    10-20 major scenes
+
+is acceptable.
+
+However, do not hard-code the number.
+
+The scene planner should calculate this based on duration.
+
+Scenes can be repeated where appropriate, but repetition should feel intentional.
+
+Avoid obvious repetitive loops.
+
+Use visual continuity.
+
+For example:
+
+    mountain
+        ↓
+    forest
+        ↓
+    river
+        ↓
+    waterfall
+        ↓
+    forest
+        ↓
+    mountain
+        ↓
+    sunset
+
+rather than random unrelated scenes.
+
+============================================================
+11. COMFYUI INTEGRATION
+============================================================
+
+ComfyUI must be integrated from the beginning.
+
+Implement a ComfyUI provider abstraction.
+
+Example:
+
+    ComfyUIProvider
+        health_check()
+        queue_workflow()
+        wait_for_result()
+        download_result()
+
+Configuration:
+
+    COMFYUI_BASE_URL=http://127.0.0.1:8188
+
+Do NOT hard-code one workflow inside application logic.
+
+Workflows must be stored separately.
+
+Example:
+
+    workflows/
+        image_generation.json
+        image_to_video.json
+        text_to_video.json
+        thumbnail_generation.json
+
+The application should pass parameters into the workflow.
+
+Do not assume a particular ComfyUI model.
+
+The workflow files should determine which model is used.
+
+============================================================
+12. IMAGE / VIDEO GENERATION STRATEGY
+============================================================
+
+The system should support three media generation modes:
+
+    IMAGE
+    VIDEO
+    HYBRID
+
+IMAGE:
+
+    Generate a still image
+    Apply slow pan/zoom/parallax effects with FFmpeg
+    Use for scenes that don't require complex movement
+
+VIDEO:
+
+    Generate a short AI video clip through ComfyUI
+    Extend its usefulness through slow motion, looping or interpolation where appropriate
+
+HYBRID:
+
+    Use image + short motion clip + FFmpeg effects
+
+The system should favor efficiency.
+
+Do not generate unnecessary AI video.
+
+For a relaxing nature video, subtle motion is sufficient.
+
+Examples:
+
+    trees moving slightly
+    clouds moving slowly
+    water flowing
+    rain falling
+    grass moving in wind
+    animal making subtle movements
+    camera slowly moving forward
+    camera slowly panning
+
+Avoid excessive camera movement.
+
+============================================================
+13. VISUAL QUALITY
+============================================================
+
+Nature videos should prioritize:
+
+- realism
+- peaceful composition
+- natural lighting
+- cinematic but believable imagery
+- slow movement
+- continuity
+- no unnecessary objects
+- no people unless explicitly requested
+- no text inside generated scenery
+- no logos
+- no watermarks
+- no distorted animals
+- no unnatural anatomy
+
+Use strong negative prompts where supported.
+
+Default negative concepts should include:
+
+    text
+    watermark
+    logo
+    distorted anatomy
+    duplicate animals
+    deformed animals
+    artificial looking vegetation
+    oversaturated colors
+    excessive sharpness
+    cartoon
+    low quality
+    artifacts
+
+Allow model-specific negative prompts to override or extend these.
+
+============================================================
+14. MUSIC GENERATION
+============================================================
+
+There is NO narration or voiceover.
+
+The video is purely:
+
+    visual
+    +
+    continuous music
+    +
+    optional nature ambience
+
+Music must be generated locally using an AI music model.
+
+Do NOT depend on cloud music generation.
+
+Create an abstraction:
+
+    MusicProvider
+
+with:
+
+    generate()
+    health_check()
+
+The initial implementation should support a configurable local AI music engine.
+
+Do not hard-code the entire application to one music model.
+
+The music model should be configurable.
+
+Example:
+
+    MUSIC_PROVIDER=local_ai
+    MUSIC_MODEL=<configured-local-model>
+
+The application should generate music based on:
+
+    mood
+    theme
+    duration
+    energy
+    environment
+
+Examples:
+
+    peaceful mountain:
+        soft ambient pads
+        very slow
+        minimal percussion
+
+    rainy forest:
+        warm ambient
+        soft piano
+        gentle atmosphere
+
+    ocean:
+        deep ambient
+        soft pads
+        minimal melodic elements
+
+Avoid music that sounds energetic, dramatic, or distracting.
+
+============================================================
+15. MUSIC LENGTH
+============================================================
+
+The generated music does not necessarily need to be exactly the final video duration.
+
+If the local music model generates shorter tracks:
+
+    Track 1
+        ↓ crossfade
+    Track 2
+        ↓ crossfade
+    Track 3
+        ↓ crossfade
+    Track 4
+
+Use FFmpeg to create a seamless continuous soundtrack.
+
+The final listener should not notice obvious track boundaries.
+
+Never simply concatenate tracks with hard cuts.
+
+Implement:
+
+    crossfade
+    volume normalization
+    optional short fade-in
+    optional short fade-out
+
+The final music should remain underneath the nature ambience.
+
+============================================================
+16. NATURE AMBIENT AUDIO
+============================================================
+
+Support optional environmental audio.
+
+Examples:
+
+    rain
+    river
+    waterfall
+    ocean
+    wind
+    birds
+    forest
+    insects
+    thunder
+    fire
+    night ambience
+
+Initially these can be local audio assets.
+
+Structure:
+
+    assets/
+        ambience/
+            rain/
+            river/
+            ocean/
+            forest/
+            wind/
+            birds/
+            thunder/
+
+The LLM chooses appropriate ambience.
+
+The audio mixer should combine:
+
+    music
+    +
+    ambience
+
+with configurable volume levels.
+
+Example:
+
+    music: 0.65
+    ambience: 0.35
+
+Do not allow ambience to overpower music unless specifically requested.
+
+============================================================
+17. FFMPEG
+============================================================
+
+FFmpeg is the final media composition engine.
+
+The system should use FFmpeg for:
+
+- image-to-video effects
+- video concatenation
+- crossfade transitions
+- audio mixing
+- audio looping
+- audio crossfades
+- normalization
+- scaling
+- aspect-ratio handling
+- frame-rate normalization
+- final encoding
+- thumbnail extraction where required
+
+Do not use Python/OpenCV for everything.
+
+Use FFmpeg wherever FFmpeg is the appropriate tool.
+
+The final output should be YouTube-compatible MP4.
+
+Default:
+
+    H.264 video
+    AAC audio
+    1920x1080
+    16:9
+    30 FPS unless source workflow requires another standard FPS
+
+Make codec/frame-rate settings configurable.
+
+============================================================
+18. THUMBNAIL
+============================================================
+
+Generate a dedicated thumbnail.
+
+Do not simply use a random frame unless configured as fallback.
+
+Preferred flow:
+
+    LLM
+      ↓
+    thumbnail concept
+      ↓
+    ComfyUI image generation
+      ↓
+    thumbnail.jpg
+
+Thumbnail requirements:
+
+- visually attractive
+- nature focused
+- clear focal point
+- suitable for YouTube
+- no unnecessary text
+- no logos
+- 16:9
+
+If thumbnail generation fails, provide a deterministic fallback by extracting a suitable
+frame from the final video.
+
+============================================================
+19. YOUTUBE METADATA
+============================================================
+
+The LLM should generate metadata from the actual project.
+
+Generate:
+
+    title
+    description
+    tags
+    category
+    language
+    suggested privacy
+    thumbnail description
+    chapters where meaningful
+
+Do not generate misleading metadata.
+
+Titles should be natural and descriptive.
+
+Avoid spammy keyword stuffing.
+
+Example title:
+
+    Peaceful Mountain Rain 🌧️ Misty Forest & River Sounds | Relaxing Nature
+
+Description should describe what is actually in the video.
+
+Tags should be relevant.
+
+Store:
+
+    youtube/title.txt
+    youtube/description.txt
+    youtube/tags.txt
+    youtube/metadata.json
+
+============================================================
+20. PROJECT CONFIGURATION
+============================================================
+
+Use configuration files rather than hard-coded settings.
+
+Example:
+
+    config/
+        app.yaml
+        models.yaml
+        video.yaml
+        audio.yaml
+
+or a clean equivalent.
+
+Central configuration should contain:
+
+    LM Studio URL
+    selected LLM model
+    ComfyUI URL
+    ComfyUI workflows
+    music provider
+    music model
+    FFmpeg location
+    default duration
+    default resolution
+    output directory
+    asset directories
+
+Environment variables may override configuration.
+
+============================================================
+21. CLI OPTIONS
+============================================================
+
+Implement a clean CLI.
+
+At minimum:
+
+    generate
+
+with options:
+
+    --prompt
+    --input
+    --duration
+    --resolution
+    --model
+    --output
+    --style
+    --music
+    --no-ambience
+    --seed
+    --dry-run
+    --resume
+
+Examples:
+
+    python -m app generate \
+        --prompt "Peaceful rainy mountain forest" \
+        --duration 15m
+
+Default:
+
+    duration = 15m
+    resolution = 1920x1080
+
+Example:
+
+    python -m app generate \
+        --input projects/rainy_mountains.txt \
+        --duration 30m \
+        --resolution 1920x1080
+
+============================================================
+22. RESUME SUPPORT
+============================================================
+
+Generation may take a long time.
+
+The application MUST support resuming failed projects.
+
+Do not restart the entire generation if one scene fails.
+
+Maintain project state.
+
+Example:
+
+    scene_001 = completed
+    scene_002 = completed
+    scene_003 = failed
+    scene_004 = pending
+
+When resumed:
+
+    python -m app generate --resume output/project_id
+
+the system should continue from the failed/pending stage.
+
+This is extremely important.
+
+============================================================
+23. DRY RUN
+============================================================
+
+Implement:
+
+    --dry-run
+
+Dry run should:
+
+- call the LLM
+- generate the project plan
+- validate it
+- show the planned scenes
+- show music plan
+- show output structure
+- NOT run expensive ComfyUI generation
+- NOT generate music
+- NOT render the final video
+
+This allows testing the LLM planning before expensive generation.
+
+============================================================
+24. LOGGING
+============================================================
+
+Implement structured logging.
+
+Log:
+
+- project ID
+- input
+- selected model
+- LLM request
+- LLM response validation
+- scene generation
+- ComfyUI workflow
+- generated files
+- music generation
+- FFmpeg commands
+- errors
+- timing
+- final output
+
+Never expose secrets.
+
+Logs should go into the project's output directory.
+
+============================================================
+25. ERROR HANDLING
+============================================================
+
+Every external/local provider must have:
+
+    health_check()
+
+Before expensive generation, check:
+
+    LM Studio
+    ComfyUI
+    FFmpeg
+    Music provider
+
+If a dependency is unavailable, fail early with a useful error.
+
+Example:
+
+    ERROR: ComfyUI is not reachable at:
+    http://127.0.0.1:8188
+
+    Start ComfyUI and retry.
+
+Do not produce cryptic Python stack traces as the only error message.
+
+============================================================
+26. VALIDATION
+============================================================
+
+Validate all LLM JSON responses.
+
+Do not trust model output blindly.
+
+Use Pydantic or equivalent.
+
+If JSON validation fails:
+
+    attempt structured repair
+
+If repair fails:
+
+    retry the LLM with the validation error
+
+Limit retries.
+
+Never allow invalid scene plans into the generation pipeline.
+
+============================================================
+27. SECURITY
+============================================================
+
+This is a local application.
+
+Do not send prompts, images, videos, audio or metadata to external services unless explicitly
+configured later.
+
+No telemetry.
+
+No analytics.
+
+No automatic cloud upload.
+
+No hidden network calls.
+
+============================================================
+28. TESTING
+============================================================
+
+Implement automated tests for:
+
+- project schema
+- scene validation
+- duration calculation
+- resolution presets
+- LLM provider
+- ComfyUI provider
+- music provider
+- output directory creation
+- metadata generation
+- FFmpeg command construction
+- resume logic
+
+Mock expensive external processes in unit tests.
+
+Do not require ComfyUI or an AI model to be running for unit tests.
+
+============================================================
+29. DEVELOPMENT APPROACH
+============================================================
+
+Do NOT attempt to write the entire application blindly in one pass.
+
+First inspect the existing repository.
+
+Determine:
+
+- existing files
+- existing language/framework
+- installed dependencies
+- available scripts
+- Python version
+- FFmpeg availability
+- LM Studio availability
+- ComfyUI availability
+
+Then propose the implementation structure.
+
+After that implement incrementally.
+
+Recommended implementation phases:
+
+PHASE 1
+    Project skeleton
+    Configuration
+    CLI
+    logging
+    project schema
+
+PHASE 2
+    LM Studio provider
+    LLM scene planner
+    JSON validation
+    dry-run
+
+PHASE 3
+    ComfyUI provider
+    image generation
+    workflow parameter injection
+
+PHASE 4
+    video generation
+    scene rendering
+    FFmpeg composition
+
+PHASE 5
+    local AI music provider
+    audio mixing
+    crossfades
+
+PHASE 6
+    thumbnail generation
+    YouTube metadata
+
+PHASE 7
+    resume support
+    error recovery
+    complete integration
+
+PHASE 8
+    separate YouTube uploader script
+
+After each phase:
+
+    run tests
+    run a small real-world test where appropriate
+    fix errors
+    document what was implemented
+
+Do not move to the next phase if the current phase is fundamentally broken.
+
+============================================================
+30. PERFORMANCE
+============================================================
+
+The user has two local machines:
+
+Machine A:
+
+    Intel Core Ultra 9 285H
+    64 GB RAM
+    Intel Arc integrated GPU
+
+Machine B:
+
+    16 GB RAM
+
+LM Studio currently provides:
+
+    qwen/qwen3.8-27b
+
+and:
+
+    prism-ml/bonsai-27b
+
+Do not assume NVIDIA CUDA.
+
+Do not hard-code CUDA requirements.
+
+ComfyUI must remain independently configurable.
+
+The application should work with CPU/local execution where supported.
+
+Do not assume that the LLM, ComfyUI and music model are all running on the same machine.
+
+Keep provider URLs configurable.
+
+============================================================
+31. FUTURE MULTI-MACHINE SUPPORT
+============================================================
+
+Do not implement distributed computing now.
+
+However, design provider interfaces so that URLs can point to another machine.
+
+For example:
+
+    LM Studio:
+        http://localhost:1234/v1
+
+    ComfyUI:
+        http://localhost:8188
+
+Later these could become:
+
+    LM Studio:
+        http://192.168.x.x:1234/v1
+
+    ComfyUI:
+        http://192.168.x.x:8188
+
+Do not introduce a complex remote-worker architecture yet.
+
+============================================================
+32. CONTENT THEMES
+============================================================
+
+Create configurable nature themes.
+
+Initial themes:
+
+    peaceful_nature
+    mountains
+    forest
+    rainforest
+    river
+    waterfall
+    ocean
+    beach
+    lake
+    rainy_day
+    thunderstorm
+    snow
+    winter
+    autumn
+    spring
+    summer
+    sunset
+    sunrise
+    misty_mountains
+    countryside
+    meadow
+    wildlife
+    birds
+    deer
+    night_forest
+    starry_sky
+    tropical
+    alpine
+    desert
+    jungle
+    fireplace
+
+The user should also be able to provide a custom theme.
+
+Example:
+
+    --prompt "A quiet autumn forest with deer and a small stream"
+
+Do not restrict the LLM to predefined themes.
+
+============================================================
+33. VISUAL STYLE OPTIONS
+============================================================
+
+Provide configurable style presets.
+
+Initial presets:
+
+    realistic
+    cinematic
+    nature_documentary
+    peaceful
+    dreamy
+    atmospheric
+    minimalist
+    photorealistic
+
+Default:
+
+    realistic_cinematic
+
+The style should affect prompts but should not override the user's subject.
+
+============================================================
+34. MUSIC STYLE OPTIONS
+============================================================
+
+Provide configurable music presets:
+
+    ambient
+    soft_piano
+    meditation
+    sleep
+    nature_ambient
+    cinematic_ambient
+    acoustic
+    minimal
+    deep_ambient
+
+Default:
+
+    ambient
+
+Music should always remain relaxing unless the user explicitly requests otherwise.
+
+============================================================
+35. TRANSITIONS
+============================================================
+
+Support:
+
+    crossfade
+    fade
+    dissolve
+    cut
+    slow_blend
+
+Default:
+
+    crossfade
+
+Avoid flashy transitions.
+
+The visual transition should match the relaxing nature style.
+
+============================================================
+36. OUTPUT NAMING
+============================================================
+
+Output directories should be deterministic and filesystem-safe.
+
+Example:
+
+    output/
+        peaceful_rainy_alps_20261006_143012/
+
+Do not use arbitrary generated strings as the only identifier.
+
+Sanitize titles.
+
+Avoid Windows filesystem-invalid characters.
+
+============================================================
+37. FINAL QUALITY CHECK
+============================================================
+
+Before marking a project as complete, run an automated validation:
+
+    ✓ video exists
+    ✓ video duration approximately matches requested duration
+    ✓ resolution matches requested preset
+    ✓ video codec valid
+    ✓ audio exists
+    ✓ audio duration matches video
+    ✓ thumbnail exists
+    ✓ thumbnail has valid dimensions
+    ✓ title exists
+    ✓ description exists
+    ✓ tags exist
+    ✓ metadata.json valid
+    ✓ project.json valid
+
+Generate:
+
+    project/validation.json
+
+Example:
+
+{
+    "status": "success",
+    "video": true,
+    "audio": true,
+    "thumbnail": true,
+    "metadata": true,
+    "duration_seconds": 901,
+    "requested_duration_seconds": 900,
+    "resolution": "1920x1080"
+}
+
+============================================================
+38. IMPORTANT DESIGN RULE
+============================================================
+
+The application should be designed as an orchestration engine.
+
+Do not put AI-specific implementation directly into business logic.
+
+Use interfaces/providers:
+
+    LLMProvider
+    ImageProvider
+    VideoProvider
+    MusicProvider
+    AudioProvider
+    Renderer
+
+Then concrete implementations:
+
+    LMStudioProvider
+    ComfyUIProvider
+    LocalMusicProvider
+    FFmpegRenderer
+
+This allows models to be replaced without rewriting the application.
+
+============================================================
+39. WHAT NOT TO BUILD YET
+============================================================
+
+Do NOT implement:
+
+- web SaaS
+- user authentication
+- cloud storage
+- subscription system
+- payments
+- Kubernetes
+- microservices
+- Redis
+- Kafka
+- database server
+- cloud LLM
+- cloud video generation
+- automatic YouTube publishing
+- mobile application
+- user accounts
+- analytics platform
+
+Keep this as a powerful local scripting tool.
+
+============================================================
+40. DEFINITION OF DONE
+============================================================
+
+The MVP is complete when I can execute something equivalent to:
+
+    python -m app generate \
+        --prompt "Peaceful rainy mountains with forest, river and deer"
+
+and the application:
+
+1. Connects to LM Studio.
+2. Uses the configured local model.
+3. Creates a validated scene plan.
+4. Creates visual prompts.
+5. Sends appropriate workflows to ComfyUI.
+6. Generates nature scenes.
+7. Generates local AI music.
+8. Loads appropriate ambient nature audio.
+9. Mixes music and ambience.
+10. Creates a continuous video using FFmpeg.
+11. Creates a thumbnail.
+12. Generates YouTube metadata.
+13. Creates one complete output folder.
+14. Validates the final package.
+15. Leaves the folder ready for a future YouTube uploader.
+
+Example:
+
+    output/
+        peaceful_rainy_mountains_20261006_143012/
+            video.mp4
+            thumbnail.jpg
+            youtube/
+                title.txt
+                description.txt
+                tags.txt
+                metadata.json
+            project/
+                project.json
+                scene_plan.json
+                validation.json
+            scenes/
+            audio/
+            logs/
+
+The user should be able to take that single folder and hand it to a separate YouTube
+upload script.
+
+============================================================
+41. CLAUDE CODE BEHAVIOR
+============================================================
+
+Act as the implementation engineer.
+
+Before modifying files:
+
+    inspect the repository.
+
+Do not overwrite existing work blindly.
+
+Prefer small, understandable modules.
+
+Do not create unnecessary abstractions.
+
+Use type hints.
+
+Use meaningful names.
+
+Write documentation for setup and execution.
+
+Create a README containing:
+
+    prerequisites
+    LM Studio setup
+    model configuration
+    ComfyUI setup
+    workflow setup
+    local music model setup
+    FFmpeg setup
+    configuration
+    CLI examples
+    troubleshooting
+    output structure
+
+When a dependency or model is uncertain, inspect the local environment first.
+
+Do not invent APIs.
+
+If a ComfyUI workflow requires user-specific node/model configuration, isolate that
+configuration into workflow files rather than embedding assumptions into Python.
+
+If a local AI music model is not installed, implement the MusicProvider interface and provide
+a concrete adapter for the selected local model, with clear setup instructions.
+
+When you encounter an implementation decision that does not block progress, make a sensible
+engineering decision and continue.
+
+Only ask me a question when the decision is genuinely blocking implementation or would
+materially change the architecture.
+
+Do not stop after creating a design document.
+
+Actually implement the code.
+
+Run tests after implementation.
+
+Fix errors before declaring a phase complete.
+
+At the end of each implementation phase, provide:
+
+    - what was implemented
+    - files changed
+    - tests executed
+    - commands to run
+    - known limitations
+    - next phase

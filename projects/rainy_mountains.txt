@@ -1,0 +1,9 @@
+# Prompt — peaceful rainy mountain forest
+# Save as: projects/rainy_mountains.txt
+# Usage: python -m app generate --input projects/rainy_mountains.txt --duration 15m
+
+A peaceful rainy mountain forest with tall pine trees, a flowing river with smooth rocks,
+morning mist drifting through the valley, gentle rain creating ripples on a still mountain lake,
+and a lone deer standing quietly among the trees. The atmosphere is serene and calming,
+with soft natural light filtering through the rain clouds. Occasional glimpses of distant
+snow-capped peaks through the mist.

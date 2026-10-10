@@ -1,0 +1,54 @@
+# ============================================================
+# Nature Video Generator — Application Configuration
+# ============================================================
+# Environment variables always override these values.
+# Use a .env file or set env vars for secrets.
+# ============================================================
+
+lm_studio:
+  base_url: "http://localhost:1234/v1"
+  api_key: "lm-studio"
+  model: "mistralai/ministral-3-3b"
+  max_tokens: 4096
+  temperature: 0.7
+  timeout_seconds: 300
+  max_retries: 3
+
+comfyui:
+  base_url: "http://127.0.0.1:8188"
+  timeout_seconds: 600
+  poll_interval_seconds: 2.0
+  client_id: "ntr-video-gen"
+
+music:
+  provider: "audiocraft"          # stub | audiocraft | musicgen
+  model: "facebook/musicgen-melody-large"
+  base_url: null
+  timeout_seconds: 300
+
+video:
+  default_duration_seconds: 900   # 15 minutes
+  default_resolution: "1920x1080"
+  default_fps: 30
+  default_style: "realistic_cinematic"
+  default_music_style: "ambient"
+  default_transition: "crossfade"
+  crossfade_duration: 1.5
+  music_volume: 0.65
+  ambience_volume: 0.35
+
+ffmpeg:
+  # Full path to ffmpeg — avoids needing PATH to be updated in all terminals
+  binary: "C:\\Users\\pon.jeyakumar\\Applications\\ffmpeg-9.0.2-full_build\\bin\\ffmpeg.exe"
+  ffprobe_binary: "C:\\Users\\pon.jeyakumar\\Applications\\ffmpeg-9.0.2-full_build\\bin\\ffprobe.exe"
+  video_codec: "libx264"
+  audio_codec: "aac"
+  video_crf: 18
+  audio_bitrate: "192k"
+  preset: "slow"
+
+paths:
+  output_dir: "output"
+  assets_dir: "assets"
+  workflows_dir: "workflows"
+  projects_dir: "projects"
