@@ -1,0 +1,52 @@
+# ── LaneSync-managed workflow ─────────────────────────────────────────────
+# This file is owned by LaneSync. Future "Update workflows" PRs may replace
+# custom edits you make here. Review the PR diff before merging.
+name: LaneSync configuration
+
+on:
+  pull_request:
+    # Drafts are skipped; marking a pull request ready (ready_for_review) runs the check.
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    # LaneSync's setup branch is skipped: setup writes one file per commit there, and those
+    # intermediate commits are not the setup PR head the configuration check recognises.
+    # The setup PR itself is validated by the pull_request run above.
+    # LaneSync's work branches are skipped too: their commits are checked by their pull request's run,
+    # so a push run there would only repeat it on the same commit.
+    branches: ['**', '!sdlc-bootstrap', '!feature/**', '!bugfix/**', '!hotfix/**', '!fix/**', '!dependabot/**']
+
+# SDLC Enforce is published by the GitHub App on the PR head SHA, including forks.
+# This job verifies CI configuration using the same backend resolver.
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  LANESYNC_API_URL: "https://lanesync.dev"
+
+jobs:
+  configuration:
+    name: LaneSync configuration
+    # Forks are evaluated server-side; private central YAML stays in LaneSync. Drafts wait for ready_for_review.
+    if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false)
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"ubuntu-latest"') }}
+    steps:
+      - name: Verify effective SDLC configuration
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPOSITORY: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          TOKEN=$(curl --fail --silent --show-error \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=lanesync" | jq -er .value)
+          RESPONSE=$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer ${TOKEN}" \
+            "${LANESYNC_API_URL}/api/ci/effective-config?org=${OWNER}&repo=${REPOSITORY}")
+          echo "${RESPONSE}" | jq -e '.fingerprint and .developmentBranch' >/dev/null
+          if echo "${RESPONSE}" | jq -e '.setupPending == true' >/dev/null; then
+            # LaneSync's setup PR: its sdlc.yaml is valid; enforcement starts after merge.
+            echo "Setup in progress — configuration valid. LaneSync enforces it after the setup PR merges."
+          else
+            echo "Effective SDLC configuration verified by LaneSync."
+          fi
