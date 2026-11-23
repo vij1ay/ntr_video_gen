@@ -1,0 +1,66 @@
+# ── LaneSync-managed workflow ─────────────────────────────────────────────
+# This file is owned by LaneSync. Future "Update workflows" PRs may replace
+# custom edits you make here. Review the PR diff before merging.
+name: "Deploy to Production"
+# LaneSync records a production deployment only for the verified candidate: keep the full
+# candidate SHA in the run name (this workflow runs on its own ref, not on the candidate).
+run-name: "Deploy ${{ inputs.release_version }} (${{ inputs.candidate_sha }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'LaneSync release milestone version'
+        required: true
+        type: string
+      candidate_sha:
+        description: 'Exact verified commit to deploy'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy-production:
+    name: "Deploy to Production"
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Verify LaneSync deployment gate for this commit
+        env:
+          LANESYNC_API_URL: "https://lanesync.dev"
+          RELEASE_VERSION: ${{ github.event.inputs.release_version }}
+          CANDIDATE_SHA: ${{ github.event.inputs.candidate_sha }}
+          REPOSITORY: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          TOKEN=$(curl --fail --silent --show-error \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=lanesync" | jq -er .value)
+          RESULT=$(curl --fail --silent --show-error --get \
+            -H "Authorization: Bearer ${TOKEN}" \
+            --data-urlencode "version=${RELEASE_VERSION}" \
+            --data-urlencode "repo=${REPOSITORY}" \
+            --data-urlencode "candidate_sha=${CANDIDATE_SHA}" \
+            "${LANESYNC_API_URL}/api/milestones/check")
+          if ! printf '%s' "$RESULT" | jq -e '.can_deploy == true and .candidate_sha == env.CANDIDATE_SHA' >/dev/null; then
+            # Say why, and which commit LaneSync would deploy, instead of a bare exit code.
+            printf '%s' "$RESULT" | jq -r '"::error title=LaneSync refused this deployment::" + ([(.reason // "The release gates have not passed."),
+              (if .candidate_tag then "Release candidate: " + .candidate_tag else empty end),
+              (if .candidate_sha then "Commit to deploy: " + .candidate_sha else empty end)] | join(" — "))'
+            printf '%s' "$RESULT" | jq -r '(.blockers // {}) | to_entries[] | select((.value | length) > 0)
+              | "Blocked at " + .key + ": " + (.value | if type == "array" then join(", ") else tostring end)' || true
+            exit 1
+          fi
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.candidate_sha }}
+
+      # Replace with your real production deployment; this starter deliberately fails until configured.
+      - name: Configure production deployment
+        run: |
+          echo "Configure real production deployment commands before enabling this workflow." >&2
+          exit 1

@@ -1,0 +1,436 @@
+# ── LaneSync-managed workflow ─────────────────────────────────────────────
+# This file is owned by LaneSync. Future "Update workflows" PRs may replace
+# custom edits you make here. Review the PR diff before merging.
+name: 'Upload Evidence to LaneSync'
+description: >
+  Detects native test/coverage/SAST/CVE report files, computes summary metrics,
+  and uploads the raw reports to LaneSync with retry. LaneSync normalizes the
+  reports server-side. Works identically for Full and Minimal tiers — only
+  report files are sent, never source code.
+
+inputs:
+  api-url:
+    description: 'LaneSync API URL (override for self-hosted)'
+    required: false
+    default: 'https://lanesync.dev'
+  api-key:
+    description: 'LaneSync API key (optional — falls back to GitHub OIDC when empty)'
+    required: false
+    default: ''
+  dev-branch:
+    description: 'Development branch name (e.g. main)'
+    required: false
+    default: 'main'
+  release-prefix:
+    description: 'Release branch prefix (e.g. release/)'
+    required: false
+    default: 'release/'
+  pipeline:
+    description: 'CI pipeline / check name (matches sdlc.yaml required check)'
+    required: false
+    default: ''
+  report-dir:
+    description: 'Directory the test step writes its test and coverage reports in, relative to the repository root (a monorepo package, e.g. backend). Trivy and SARIF reports are read from the repository root.'
+    required: false
+    default: '.'
+
+outputs:
+  evidence-id:
+    description: 'ID of the created evidence record in LaneSync'
+    value: ${{ steps.upload.outputs.evidence_id }}
+  upload-status:
+    description: 'success | skipped | failed'
+    value: ${{ steps.upload.outputs.status }}
+
+runs:
+  using: 'composite'
+  steps:
+
+    # ── 1. Resolve environment from GITHUB_REF ─────────────────────────────
+    - name: Resolve environment
+      id: env
+      shell: bash
+      env:
+        DEV_BRANCH: ${{ inputs.dev-branch }}
+        RELEASE_PREFIX: ${{ inputs.release-prefix }}
+      run: |
+        REF="${GITHUB_REF#refs/heads/}"
+        if [ "$GITHUB_EVENT_NAME" = "release" ]; then
+          echo "environment=production" >> "$GITHUB_OUTPUT"
+          echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          echo "should_upload=true" >> "$GITHUB_OUTPUT"
+        elif [ "$REF" = "$DEV_BRANCH" ]; then
+          echo "environment=dev" >> "$GITHUB_OUTPUT"
+          echo "version=dev" >> "$GITHUB_OUTPUT"
+          echo "should_upload=true" >> "$GITHUB_OUTPUT"
+        elif [[ "$REF" == "$RELEASE_PREFIX"* ]]; then
+          echo "environment=staging" >> "$GITHUB_OUTPUT"
+          echo "version=${REF#"$RELEASE_PREFIX"}" >> "$GITHUB_OUTPUT"
+          echo "should_upload=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "environment=none" >> "$GITHUB_OUTPUT"
+          echo "version=none" >> "$GITHUB_OUTPUT"
+          echo "should_upload=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    # ── 2a. Tools the upload needs (self-hosted runners may not have them) ──
+    - name: Check tools
+      id: tools
+      if: steps.env.outputs.should_upload == 'true'
+      shell: bash
+      run: |
+        # GitHub-hosted runners have jq and curl. A self-hosted runner without them gets a warning and no upload,
+        # never a failed job: reports are evidence, not a build step.
+        missing=""
+        for tool in jq curl gzip; do command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"; done
+        if [ -n "$missing" ]; then
+          echo "::warning::LaneSync reports were not sent: this runner is missing$missing. Install them on the runner (for example apt-get install jq curl gzip)."
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    # ── 2. Detect report files, compute metrics, build payload ─────────────
+    - name: Collect reports
+      id: reports
+      if: steps.env.outputs.should_upload == 'true' && steps.tools.outputs.ready == 'true'
+      shell: bash
+      env:
+        ORG: ${{ github.repository_owner }}
+        PIPELINE: ${{ inputs.pipeline }}
+        REPORT_DIR: ${{ inputs.report-dir }}
+        ENVIRONMENT: ${{ steps.env.outputs.environment }}
+        VERSION: ${{ steps.env.outputs.version }}
+      run: |
+        # Runs under `bash -eo pipefail`: every helper below must tolerate
+        # "no match" / missing files without a non-zero exit.
+        PIPELINE="${PIPELINE:-${GITHUB_WORKFLOW:-${GITHUB_JOB:-}}}"
+        [ -n "$PIPELINE" ] || { echo "::error::No CI pipeline identity is available"; exit 1; }
+        OUT="${RUNNER_TEMP:-/tmp}/lanesync"
+        # Test and coverage reports are looked up in the test step's directory; it must stay inside the workspace.
+        RD="${REPORT_DIR:-.}"; RD="${RD%/}"
+        case "$RD" in /*|..|../*|*/..|*/../*) echo "::warning::report-dir \"$RD\" is outside the repository; using the root"; RD=. ;; esac
+        [ -d "$RD" ] || { echo "::warning::report-dir \"$RD\" does not exist; using the root"; RD=.; }
+        rm -rf "$OUT" && mkdir -p "$OUT"
+        MAX_FILE_BYTES=5000000
+
+        int() { local v; v=$("$@" 2>/dev/null) || v=0; [[ "$v" =~ ^[0-9]+$ ]] || v=0; echo "$v"; }
+        count() { { grep -oE "$1" "$2" 2>/dev/null || true; } | wc -l | tr -d ' '; }
+        fits() { [ -f "$1" ] && [ "$(wc -c < "$1" | tr -d ' ')" -le "$MAX_FILE_BYTES" ]; }
+        append_file() { # <list.json> <path> [format]
+          if ! fits "$2"; then
+            [ -f "$2" ] && echo "::warning::Skipping $2 (larger than $MAX_FILE_BYTES bytes)"
+            return 0
+          fi
+          jq --rawfile c "$2" --arg fn "$(basename "$2")" --arg fmt "${3:-}" \
+            '. + [{filename: $fn, content: $c} + (if $fmt == "" then {} else {format: $fmt} end)]' \
+            "$1" > "$1.tmp" && mv "$1.tmp" "$1"
+        }
+
+        # ── Test reports ──────────────────────────────────────────────────
+        TEST_FILES=()
+        for f in pytest-junit.xml jest-results.json go-test.json rspec-results.json rspec.json \
+                 phpunit-junit.xml ctest-junit.xml test-results.xml junit.xml; do
+          if [ -f "$RD/$f" ]; then TEST_FILES+=("$RD/$f"); fi
+        done
+        while IFS= read -r f; do
+          [ -n "$f" ] && TEST_FILES+=("$f")
+        done < <(find "$RD" \( -path '*/target/surefire-reports/TEST-*.xml' -o -path '*/build/test-results/*/TEST-*.xml' \) \
+                   -not -path '*/node_modules/*' 2>/dev/null | sort | head -500)
+
+        UNIT_TOTAL=0; UNIT_PASSED=0; UNIT_FAILED=0
+        for f in ${TEST_FILES[@]+"${TEST_FILES[@]}"}; do
+          t=0; p=0; x=0
+          case "$f" in
+            *.xml)
+              t=$(count '<testcase[ >]' "$f")
+              x=$(count '<(failure|error)[ >/]' "$f")
+              s=$(count '<skipped[ >/]' "$f")
+              p=$((t - x - s)); [ "$p" -lt 0 ] && p=0
+              ;;
+            *go-test.json)
+              p=$(int jq -s '[.[] | select(.Action=="pass" and (.Test // "") != "")] | length' "$f")
+              x=$(int jq -s '[.[] | select(.Action=="fail" and (.Test // "") != "")] | length' "$f")
+              t=$((p + x))
+              ;;
+            *jest-results.json)
+              t=$(int jq '.numTotalTests // 0' "$f")
+              p=$(int jq '.numPassedTests // 0' "$f")
+              x=$(int jq '.numFailedTests // 0' "$f")
+              ;;
+            *rspec*.json)
+              t=$(int jq '.summary.example_count // 0' "$f")
+              x=$(int jq '.summary.failure_count // 0' "$f")
+              s=$(int jq '.summary.pending_count // 0' "$f")
+              p=$((t - x - s)); [ "$p" -lt 0 ] && p=0
+              ;;
+          esac
+          UNIT_TOTAL=$((UNIT_TOTAL + t)); UNIT_PASSED=$((UNIT_PASSED + p)); UNIT_FAILED=$((UNIT_FAILED + x))
+        done
+
+        # ── Coverage (first match wins; format detected from content) ─────
+        COV_FILE=""
+        for f in coverage/cobertura.xml coverage/cobertura-coverage.xml coverage.xml \
+                 target/site/jacoco/jacoco.xml build/reports/jacoco/test/jacocoTestReport.xml \
+                 coverage/clover.xml clover.xml coverage/lcov.info lcov.info coverage.out; do
+          if [ -f "$RD/$f" ]; then COV_FILE="$RD/$f"; break; fi
+        done
+        if [ -z "$COV_FILE" ]; then
+          COV_FILE=$(find "$RD" \( -path '*/site/jacoco/jacoco.xml' -o -path '*/reports/jacoco/*/*.xml' \) \
+                       -not -path '*/node_modules/*' 2>/dev/null | head -1)
+        fi
+
+        COV_FORMAT=""
+        if [ -n "$COV_FILE" ]; then
+          case "$COV_FILE" in
+            *.info) COV_FORMAT="lcov" ;;
+            *.out)  COV_FORMAT="gocover" ;;
+            *)
+              if grep -q '<report' "$COV_FILE"; then COV_FORMAT="jacoco"
+              elif grep -q 'clover=' "$COV_FILE" || grep -q '<project' "$COV_FILE"; then COV_FORMAT="clover"
+              elif grep -q 'line-rate=' "$COV_FILE"; then COV_FORMAT="cobertura"
+              fi
+              ;;
+          esac
+        fi
+
+        # Two decimals: rounding 79.6% up to 80 would pass a min_line_percent: 80 gate.
+        # COV_PCT stays empty (not measured) unless a coverage report was parsed.
+        pct() { awk -v c="$1" -v t="$2" 'BEGIN { if (t > 0) printf "%.2f", (c / t) * 100 }'; }
+        COV_PCT=""
+        case "$COV_FORMAT" in
+          cobertura)
+            RATE=$({ grep -oE '<coverage[^>]*line-rate="[0-9.]+"' "$COV_FILE" || true; } | head -1 | sed -E 's/.*line-rate="([0-9.]+)".*/\1/')
+            [ -n "$RATE" ] && COV_PCT=$(awk -v r="$RATE" 'BEGIN { printf "%.2f", r * 100 }')
+            ;;
+          jacoco)
+            # The report-level LINE counter is the last one in the file.
+            LINE=$({ grep -oE '<counter type="LINE" missed="[0-9]+" covered="[0-9]+"' "$COV_FILE" || true; } | tail -1)
+            M=$(echo "$LINE" | sed -nE 's/.*missed="([0-9]+)".*/\1/p'); C=$(echo "$LINE" | sed -nE 's/.*covered="([0-9]+)".*/\1/p')
+            [ -n "$C" ] && COV_PCT=$(pct "$C" "$(( ${M:-0} + C ))")
+            ;;
+          clover)
+            # The project-level <metrics> element is the last one in the file.
+            MET=$({ grep -oE '<metrics [^>]*>' "$COV_FILE" || true; } | tail -1)
+            S=$(echo "$MET" | sed -nE 's/.* statements="([0-9]+)".*/\1/p'); C=$(echo "$MET" | sed -nE 's/.*coveredstatements="([0-9]+)".*/\1/p')
+            [ -n "$C" ] && COV_PCT=$(pct "$C" "${S:-0}")
+            ;;
+          lcov)
+            COV_PCT=$(awk -F: '/^LH:/{h+=$2} /^LF:/{f+=$2} END { if (f > 0) printf "%.2f", (h / f) * 100 }' "$COV_FILE")
+            ;;
+          gocover)
+            COV_PCT=$(awk 'NR > 1 && NF == 3 { t += $2; if ($3 > 0) c += $2 } END { if (t > 0) printf "%.2f", (c / t) * 100 }' "$COV_FILE")
+            ;;
+        esac
+
+        # ── SAST (SARIF) & CVE (Trivy JSON) ───────────────────────────────
+        SAST_CRIT=0; SAST_HIGH=0; SAST_MED=0
+        SARIF="$OUT/sast.sarif"
+        if [ -f sast.sarif ]; then
+          # LaneSync never receives source code: drop every code excerpt SARIF can carry
+          # (snippets, context regions, embedded artifact contents, suggested-fix code).
+          # If the file cannot be sanitized it is not sent at all.
+          jq 'walk(if type == "object" then del(.snippet, .contextRegion, .contents, .artifactChanges) else . end)' \
+            sast.sarif > "$SARIF" 2>/dev/null || rm -f "$SARIF"
+        fi
+        if [ -f "$SARIF" ]; then
+          # Same grading as LaneSync's SARIF parser: a rule's CVSS `security-severity` wins,
+          # else the result level (falling back to the rule default) maps
+          # error→high, warning→medium, note→low.
+          jq -r '
+            .runs[]? as $r
+            | ([$r.tool.driver.rules[]? | select(.id != null) | {key: .id, value: .}] | from_entries) as $rules
+            | $r.results[]?
+            | ($rules[.ruleId // ""] // {}) as $rule
+            | ($rule.properties["security-severity"] // null | if . == null then null else (tostring | tonumber? // null) end) as $score
+            | if $score != null then
+                (if $score >= 9 then "critical" elif $score >= 7 then "high" elif $score >= 4 then "medium" elif $score > 0 then "low" else "info" end)
+              else
+                ({"error": "high", "warning": "medium", "note": "low", "none": "info"}[.level // $rule.defaultConfiguration.level // "warning"] // "medium")
+              end' "$SARIF" > "$OUT/sast-severity.txt" 2>/dev/null || : > "$OUT/sast-severity.txt"
+          SAST_CRIT=$(count '^critical$' "$OUT/sast-severity.txt")
+          SAST_HIGH=$(count '^high$' "$OUT/sast-severity.txt")
+          SAST_MED=$(count '^medium$' "$OUT/sast-severity.txt")
+        fi
+
+        CVE_CRIT=0; CVE_HIGH=0; CVE_MED=0
+        if [ -f trivy.json ]; then
+          # Keep only fields LaneSync needs — full Trivy output carries large descriptions.
+          jq '{SchemaVersion, ArtifactName, Results: [.Results[]? | {Target, Class, Type, Vulnerabilities: [.Vulnerabilities[]? | {VulnerabilityID, PkgName, InstalledVersion, FixedVersion, Severity, Title, CVSS}]}]}' \
+            trivy.json > "$OUT/trivy.json" 2>/dev/null || cp trivy.json "$OUT/trivy.json"
+          CVE_CRIT=$(int jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$OUT/trivy.json")
+          CVE_HIGH=$(int jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$OUT/trivy.json")
+          CVE_MED=$(int jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$OUT/trivy.json")
+        fi
+
+        # ── HTML views ────────────────────────────────────────────────────
+        # LaneSync renders the unit-test, coverage, SAST and CVE views from the raw reports
+        # below. unit-tests.html is sent only as a fallback for runners LaneSync cannot parse.
+        # integration-tests.html is not sent: a placeholder page must not read as a passing suite. LaneSync counts
+        # Integration tests from the reports of an artifact (or the job id) named for them. coverage/index.html is
+        # never sent because tool-generated coverage HTML embeds source files.
+        echo '{}' > "$OUT/reports.json"
+        add_report() { # <key> <path>
+          if fits "$2"; then
+            jq --rawfile c "$2" --arg k "$1" '. + {($k): $c}' "$OUT/reports.json" > "$OUT/reports.tmp" \
+              && mv "$OUT/reports.tmp" "$OUT/reports.json"
+          fi
+        }
+        add_report unit_tests unit-tests.html
+
+        # ── Raw report lists (built from files — never via argv) ──────────
+        for list in tests coverage sast cve; do echo '[]' > "$OUT/$list.json"; done
+        for f in ${TEST_FILES[@]+"${TEST_FILES[@]}"}; do append_file "$OUT/tests.json" "$f"; done
+        [ -n "$COV_FORMAT" ] && append_file "$OUT/coverage.json" "$COV_FILE" "$COV_FORMAT"
+        [ -f "$SARIF" ] && append_file "$OUT/sast.json" "$SARIF" sarif
+        [ -f "$OUT/trivy.json" ] && append_file "$OUT/cve.json" "$OUT/trivy.json" trivy
+
+        # A metric block is sent only when its report was found, parsed and attached. A scanner that
+        # failed to install or run leaves no report, which LaneSync shows as "not measured"
+        # (and a configured quality gate blocks) instead of a fake clean 0/0/0.
+        # Only reports actually attached count: LaneSync re-derives the numbers from them, and an
+        # oversized report is skipped above.
+        HAS_SAST=$(jq 'length > 0' "$OUT/sast.json")
+        HAS_CVE=$(jq 'length > 0' "$OUT/cve.json")
+        [ -n "$COV_FORMAT" ] && [ "$(jq 'length' "$OUT/coverage.json")" = 0 ] && COV_PCT=""
+        jq -n \
+          --argjson unit_total "$UNIT_TOTAL" --argjson unit_passed "$UNIT_PASSED" --argjson unit_failed "$UNIT_FAILED" \
+          --arg cov_pct "$COV_PCT" \
+          --argjson has_sast "$HAS_SAST" --argjson has_cve "$HAS_CVE" \
+          --argjson sast_crit "$SAST_CRIT" --argjson sast_high "$SAST_HIGH" --argjson sast_med "$SAST_MED" \
+          --argjson cve_crit "$CVE_CRIT" --argjson cve_high "$CVE_HIGH" --argjson cve_med "$CVE_MED" \
+          '{ unit_tests: { total: $unit_total, passed: $unit_passed, failed: $unit_failed } }
+            + (if $cov_pct != "" then { coverage: { line_percent: ($cov_pct | tonumber) } } else {} end)
+            + (if $has_sast then { sast_scan: { vulnerabilities: { critical: $sast_crit, high: $sast_high, medium: $sast_med } } } else {} end)
+            + (if $has_cve then { security: { tool: "trivy", vulnerabilities: { critical: $cve_crit, high: $cve_high, medium: $cve_med } } } else {} end)
+          ' > "$OUT/metrics.json"
+
+        jq -n \
+          --arg org "$ORG" --arg repo "${GITHUB_REPOSITORY#*/}" \
+          --arg version "$VERSION" --arg env "$ENVIRONMENT" --arg pipeline "$PIPELINE" \
+          --arg run_id "${GITHUB_RUN_ID:-}" --arg run_attempt "${GITHUB_RUN_ATTEMPT:-}" --arg head_sha "${GITHUB_SHA:-}" --arg job "${GITHUB_JOB:-}" \
+          --slurpfile metrics "$OUT/metrics.json" --slurpfile reports "$OUT/reports.json" \
+          --slurpfile tests "$OUT/tests.json" --slurpfile cov "$OUT/coverage.json" \
+          --slurpfile sast "$OUT/sast.json" --slurpfile cve "$OUT/cve.json" \
+          '{
+            org: $org, repo: $repo, version: $version, environment: $env, pipeline: $pipeline,
+            run_id: $run_id, run_attempt: $run_attempt, head_sha: $head_sha, job: $job,
+            metrics: $metrics[0], reports: $reports[0],
+            test_report_files: $tests[0], coverage_files: $cov[0],
+            sast_files: $sast[0], cve_files: $cve[0]
+          }' > "$OUT/payload.json"
+        gzip -c "$OUT/payload.json" > "$OUT/payload.json.gz"
+
+        echo "Detected: tests=[${TEST_FILES[*]:-none}] coverage=${COV_FILE:-none}(${COV_FORMAT:-n/a}) sast=$([ -f "$SARIF" ] && echo yes || echo no) cve=$([ -f trivy.json ] && echo yes || echo no)"
+        echo "Payload: $(wc -c < "$OUT/payload.json" | tr -d ' ') bytes ($(wc -c < "$OUT/payload.json.gz" | tr -d ' ') gzipped)"
+
+        {
+          echo "payload=$OUT/payload.json.gz"
+          echo "unit_total=$UNIT_TOTAL"
+          echo "unit_passed=$UNIT_PASSED"
+          echo "unit_failed=$UNIT_FAILED"
+          echo "cov_pct=$COV_PCT"
+        } >> "$GITHUB_OUTPUT"
+
+    # ── 3. Authenticate (API key, else GitHub OIDC) ────────────────────────
+    - name: Get auth token
+      id: auth
+      if: steps.env.outputs.should_upload == 'true' && steps.tools.outputs.ready == 'true'
+      shell: bash
+      env:
+        LANESYNC_API_KEY: ${{ inputs.api-key }}
+      run: |
+        if [ -n "$LANESYNC_API_KEY" ]; then
+          echo "::add-mask::$LANESYNC_API_KEY"
+          echo "token=$LANESYNC_API_KEY" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "::warning::No LaneSync API key and OIDC unavailable (job needs 'permissions: id-token: write') — skipping upload"
+          exit 0
+        fi
+        TOKEN=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=lanesync" | jq -r '.value // empty' 2>/dev/null || true)
+        if [ -z "$TOKEN" ]; then
+          echo "::warning::OIDC token request failed — skipping upload"
+          exit 0
+        fi
+        echo "::add-mask::$TOKEN"
+        echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+    # ── 4. Upload with retry (only transient failures are retried) ─────────
+    - name: Upload to LaneSync
+      id: upload
+      if: steps.env.outputs.should_upload == 'true' && steps.tools.outputs.ready == 'true' && steps.auth.outputs.token != ''
+      shell: bash
+      env:
+        SDLC_API_URL: ${{ inputs.api-url }}
+        TOKEN: ${{ steps.auth.outputs.token }}
+        PAYLOAD: ${{ steps.reports.outputs.payload }}
+      run: |
+        BODY="${RUNNER_TEMP:-/tmp}/lanesync/response.json"
+        STATUS="failed"
+        for attempt in 1 2 3; do
+          CODE=$(curl --silent --show-error --output "$BODY" --write-out '%{http_code}' \
+            --connect-timeout 10 --max-time 90 \
+            -X POST "${SDLC_API_URL%/}/api/evidence/upload" \
+            -H "Content-Type: application/json" \
+            -H "Content-Encoding: gzip" \
+            -H "Authorization: Bearer $TOKEN" \
+            --data-binary "@$PAYLOAD" 2>/dev/null) || CODE="000"
+          if [[ "$CODE" == 2* ]]; then
+            echo "evidence_id=$(jq -r '.evidenceId // empty' "$BODY" 2>/dev/null || true)" >> "$GITHUB_OUTPUT"
+            STATUS="success"
+            break
+          fi
+          MSG=$(jq -r '.error // empty' "$BODY" 2>/dev/null || true)
+          if [[ "$CODE" != 000 && "$CODE" != 429 && "$CODE" != 5* ]]; then
+            echo "::warning::LaneSync rejected the upload (HTTP $CODE): ${MSG:-no details}"
+            break
+          fi
+          if [ "$attempt" -lt 3 ]; then
+            echo "::warning::Upload attempt $attempt failed (HTTP $CODE) — retrying in $((attempt * 5))s"
+            sleep $((attempt * 5))
+          else
+            echo "::warning::Evidence upload failed after 3 attempts (HTTP $CODE, non-blocking)"
+          fi
+        done
+        echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+
+    # ── 5. Step summary ────────────────────────────────────────────────────
+    - name: Step summary
+      if: steps.env.outputs.should_upload == 'true' && steps.tools.outputs.ready == 'true'
+      shell: bash
+      env:
+        ENVIRONMENT: ${{ steps.env.outputs.environment }}
+        VERSION: ${{ steps.env.outputs.version }}
+        STATUS: ${{ steps.upload.outputs.status || 'skipped' }}
+        EVIDENCE_ID: ${{ steps.upload.outputs.evidence_id }}
+        UNIT_TOTAL: ${{ steps.reports.outputs.unit_total }}
+        UNIT_PASSED: ${{ steps.reports.outputs.unit_passed }}
+        UNIT_FAILED: ${{ steps.reports.outputs.unit_failed }}
+        COV_PCT: ${{ steps.reports.outputs.cov_pct }}
+      run: |
+        {
+          echo "## LaneSync Evidence"
+          echo ""
+          echo "| Field | Value |"
+          echo "|-------|-------|"
+          echo "| Environment | \`$ENVIRONMENT\` |"
+          echo "| Version | \`$VERSION\` |"
+          echo "| Tests | $UNIT_PASSED passed / $UNIT_FAILED failed / $UNIT_TOTAL total |"
+          echo "| Coverage | ${COV_PCT:+$COV_PCT%}${COV_PCT:-Not measured} |"
+          case "$STATUS" in
+            success) echo "| Upload | Success${EVIDENCE_ID:+ (evidence \`$EVIDENCE_ID\`)} |" ;;
+            failed)  echo "| Upload | Failed (non-blocking) |" ;;
+            *)       echo "| Upload | Skipped (no credentials) |" ;;
+          esac
+        } >> "$GITHUB_STEP_SUMMARY"
+        rm -rf "${RUNNER_TEMP:-/tmp}/lanesync"
+
+    # ── Skip notice ────────────────────────────────────────────────────────
+    - name: Skip notice
+      if: steps.env.outputs.should_upload != 'true'
+      shell: bash
+      run: |
+        echo "LaneSync upload skipped — not a dev/release branch or release event."

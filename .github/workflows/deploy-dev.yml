@@ -1,0 +1,24 @@
+# ── LaneSync-managed workflow ─────────────────────────────────────────────
+# This file is owned by LaneSync. Future "Update workflows" PRs may replace
+# custom edits you make here. Review the PR diff before merging.
+name: Deploy to Dev
+
+on:
+  push:
+    branches:
+      - "main"
+    paths-ignore:
+      - 'README.md'
+
+jobs:
+  deploy-dev:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # IMPORTANT: Replace this step with your actual development deployment commands!
+      - name: Deploy to Development
+        run: |
+          echo "Simulating deployment to Development Environment..."
+          echo "✅ Dev Deployment Successful"

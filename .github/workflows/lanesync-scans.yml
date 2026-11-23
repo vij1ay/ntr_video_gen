@@ -1,0 +1,495 @@
+# ── LaneSync-managed workflow ─────────────────────────────────────────────
+# This file is owned by LaneSync. Future "Update workflows" PRs may replace
+# custom edits you make here. Review the PR diff before merging.
+# LaneSync security scans: dependencies (Trivy), code (Opengrep with LaneSync's rule pack), secrets (gitleaks)
+# and container images (Trivy). Results are uploaded to LaneSync with GitHub OIDC; no secret is needed.
+#
+# Everything is detected at run time from the checkout and sdlc.yaml (`scans:`); the only value set for
+# this repository is the build workflow the image scan waits for.
+#
+# Supported: github.com, Linux runners (x64 or arm64; GitHub-hosted or self-hosted) with curl, git and
+# coreutils; images in GHCR (read with this workflow's token, `packages: read`). Images in other registries
+# are reported as "Not measured (registry not supported yet)". Paths in `scans.skip_paths` (samples, templates and
+# other code that is not shipped) are left out of the dependency and code scans, never out of the secret scan. When
+# a package registry refuses the dependency scan's requests (e.g. Maven Central rate limits), it runs once more
+# offline and the evidence says so. Secrets are scanned in the commits since the
+# previous production release tag (sdlc.yaml `release_naming`; never a release-candidate tag or a tag on the
+# scanned commit); the first release (no such tag yet) scans the last 200 commits, and the evidence records the
+# range and commit count.
+#
+# Isolation: this workflow never runs repository code (no installs, builds, scripts or local actions).
+# Scanners are pinned release binaries verified by SHA-256; the rule pack is pinned by SHA-256 (LaneSync keeps
+# serving every released pack, so an older pin keeps scanning and the evidence notes the update). The scan
+# jobs hold no OIDC token: only the upload job can request one, and it never checks out the repository.
+name: LaneSync scans
+
+on:
+  push:
+    # Every branch except LaneSync's work-branch prefixes (no run at all there); the plan job then scans only the
+    # development and release branches named in sdlc.yaml. Tag pushes never trigger (branch filter only).
+    # A development branch named like a work branch is added back at the end of this list when LaneSync writes the file.
+    branches: ['**', '!feature/**', '!bugfix/**', '!hotfix/**', '!fix/**', '!dependabot/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lanesync-scans-${{ github.event_name }}-${{ github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: true
+
+env:
+  LANESYNC_API_URL: "https://lanesync.dev"
+  LANESYNC_RULES_SHA256: "63e4823ca0122a182707d3cff3ac39128a66d5499c45a5eb2c4a6ea594fdf6c9"
+  YQ_VERSION: v4.54.1
+  YQ_SHA256_X64: 8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f
+  YQ_SHA256_ARM64: 189088da0c6429ec5178dfaab1a114805f6cab0b61b165ab236efedf1d57a71b
+  JQ_VERSION: jq-1.8.2
+  JQ_SHA256_X64: b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f
+  JQ_SHA256_ARM64: 8b85c817833814ddca00a144c33705546355afccf0cf39b188f3cdb48b852309
+  TRIVY_VERSION: 0.75.0
+  TRIVY_SHA256_X64: c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f
+  TRIVY_SHA256_ARM64: a1ee9f6ffb7d112b64ff726a2a0717c21175c1114361391f4a132956751a13b3
+  OPENGREP_VERSION: v1.31.0
+  OPENGREP_SHA256_MANYLINUX_X64: dbbe3c2058dbe600c449a8ba22ea79a1643a6660658400090d0323a8d0d31147
+  OPENGREP_SHA256_MANYLINUX_ARM64: 2b713a29a00237f85408b83002fc111db5b94c7fa8d263f0a93184a960655d9d
+  OPENGREP_SHA256_MUSL_X64: 02c9fba481611aa0664bc79ccf7ce59e9e334b76af8921c80b2f738d17fabf9b
+  OPENGREP_SHA256_MUSL_ARM64: b7cbedab0b6c9953ea27ce3baa006ad8b6fa1c50ee7433638b63f7fc731519d9
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256_X64: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  GITLEAKS_SHA256_ARM64: e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080
+  SECRETS_MAX_COMMITS: "200"
+
+jobs:
+  plan:
+    name: Plan
+    # A workflow_run only scans a successful push (or manual) build of this repository, never a fork's.
+    if: >-
+      github.event_name != 'workflow_run' || (
+      (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.conclusion == 'success')
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"ubuntu-latest"') }}
+    timeout-minutes: 10
+    outputs:
+      source: ${{ steps.plan.outputs.source }}
+      images: ${{ steps.plan.outputs.images }}
+      environment: ${{ steps.plan.outputs.environment }}
+      version: ${{ steps.plan.outputs.version }}
+      subject_sha: ${{ steps.plan.outputs.subject_sha }}
+      image_list: ${{ steps.plan.outputs.image_list }}
+      image_tag: ${{ steps.plan.outputs.image_tag }}
+      skip: ${{ steps.plan.outputs.skip }}
+      release_tag_re: ${{ steps.plan.outputs.release_tag_re }}
+      skip_paths: ${{ steps.plan.outputs.skip_paths }}
+    steps:
+      # Only sdlc.yaml is read, from the commit this workflow runs on (the default branch for workflow_run).
+      - name: Read sdlc.yaml
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: sdlc.yaml
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+
+      - name: Install yq
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in x86_64|amd64) A=amd64; SUM="$YQ_SHA256_X64" ;; aarch64|arm64) A=arm64; SUM="$YQ_SHA256_ARM64" ;;
+            *) echo "::error::LaneSync scans support x64 and arm64 Linux runners"; exit 1 ;; esac
+          BIN="$RUNNER_TEMP/lanesync-bin"; mkdir -p "$BIN"; echo "$BIN" >> "$GITHUB_PATH"
+          fetch() { local rc=0; curl -fsSL --retry 8 --retry-max-time 300 --proto '=https' -o "$3" "$1" || rc=$?; if [ "$rc" -ne 0 ]; then echo "::warning::could not download $1 (curl exit $rc)"; rm -f "$3"; return 1; fi; echo "$2  $3" | sha256sum -c --quiet - || { echo "::error::checksum mismatch for $1"; rm -f "$3"; return 1; }; }
+          fetch "https://github.com/mikefarah/yq/releases/download/$YQ_VERSION/yq_linux_$A" "$SUM" "$BIN/yq" || exit 1
+          chmod +x "$BIN/yq"
+
+      - name: Plan
+        id: plan
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          SOURCE=false; IMAGESCAN=false; ENV=""; VERSION=""; SUBJECT=""; LIST=""; TAGV=""; SKIP=""; TAGRE=""; SKIPPATHS=""
+          finish() {
+            { echo "source=$SOURCE"; echo "images=$IMAGESCAN"; echo "environment=$ENV"; echo "version=$VERSION"; echo "subject_sha=$SUBJECT"
+              echo "image_list=$LIST"; echo "image_tag=$TAGV"; echo "skip=$SKIP"; echo "release_tag_re=$TAGRE"; echo "skip_paths=$SKIPPATHS"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          y() { [ -f sdlc.yaml ] && yq -r "$1" sdlc.yaml 2>/dev/null || true; }
+          if [ -f sdlc.yaml ] && ! yq -e '.' sdlc.yaml >/dev/null 2>&1; then echo "::warning::sdlc.yaml is not valid YAML; LaneSync scans skipped"; finish; fi
+          # Production release tags as sdlc.yaml names releases (release_naming.format), for the secrets baseline.
+          # Release-candidate tags (<release>-rc.N) are excluded by the scan whatever the format.
+          # lanesync:release-tags:begin
+          case "$(y '.release_naming.format // ""')" in
+            semver-v-strict) TAGRE='^v[0-9]+\.[0-9]+\.[0-9]+$' ;;
+            semver-plain) TAGRE='^[0-9]+\.[0-9]+\.[0-9]+$' ;;
+            semver-v-prerelease) TAGRE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' ;;
+            semver-plain-prerelease) TAGRE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' ;;
+            semver-loose-major) TAGRE='^v[0-9]+$' ;;
+            calver-YYYY-MM-DD) TAGRE='^[0-9]{4}[.-][0-9]{2}[.-][0-9]{2}$' ;;
+            calver-YYYY-MM) TAGRE='^[0-9]{4}[.-][0-9]{2}$' ;;
+            calver-YY-MM) TAGRE='^[0-9]{2}[.-][0-9]{2}$' ;;
+            train-YYYY-Qn) TAGRE='^[0-9]{4}-Q[1-4]$' ;;
+            custom) TAGRE='.' ;;
+            *) TAGRE='^v?[0-9]+\.[0-9]+\.[0-9]+$' ;;
+          esac
+          # lanesync:release-tags:end
+          # Canonical `stages:` or legacy root stages, as LaneSync reads them.
+          DEV=$(y '.stages.development.branch // .development.branch // ""'); DEV=${DEV:-$DEFAULT_BRANCH}
+          TESTING=$(y '.stages.testing.branch_pattern // .testing.branch_pattern // ""')
+          ENABLED=$(y '.scans.enabled')   # not `// true`: yq treats false as missing
+          SKIP=$(y '(.scans.skip // []) | join(",")')
+          TAG=$(y '.scans.image_tag // ""'); [ -n "$TAG" ] || TAG='sha-{sha}'
+          skipped() { case ",$SKIP," in *,"$1",*) return 0 ;; esac; return 1; }
+          if [ "$ENABLED" = "false" ]; then echo "Scans are turned off in sdlc.yaml (scans.enabled: false)."; finish; fi
+          if [ "$EVENT" = "workflow_run" ]; then
+            if [ "$RUN_HEAD_BRANCH" != "$DEV" ]; then echo "The build ran on another branch than the development branch ($DEV); no image scan."; finish; fi
+            if skipped images; then echo "Image scans are skipped in sdlc.yaml."; finish; fi
+            for IMAGE in $(y '(.scans.images // [])[]'); do
+              if [[ "$IMAGE" =~ ^[a-z0-9]+([._-]+[a-z0-9]+)*(:[0-9]{1,5})?(/[a-z0-9]+([._-]+[a-z0-9]+)*)*$ ]]; then LIST="${LIST:+$LIST }$IMAGE"
+              else echo "::warning::Ignoring scans.images entry that is not an image name without a tag"; fi
+            done
+            if [ -z "$LIST" ]; then echo "sdlc.yaml lists no scans.images; no image scan."; finish; fi
+            [[ "$RUN_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::The build run has no commit"; exit 1; }
+            TAGV=${TAG//\{sha\}/$RUN_HEAD_SHA}; TAGV=${TAGV//\{short_sha\}/${RUN_HEAD_SHA:0:7}}
+            [[ "$TAGV" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || { echo "::error::scans.image_tag does not give a valid image tag"; exit 1; }
+            IMAGESCAN=true; ENV=dev; VERSION=dev; SUBJECT=$RUN_HEAD_SHA
+            finish
+          fi
+          [ "$REF_TYPE" = "branch" ] || { echo "Not a branch; no scan."; finish; }
+          if [ "$REF_NAME" = "$DEV" ]; then ENV=dev; VERSION=dev
+          elif [ -n "$TESTING" ] && [ "$TESTING" != "$DEV" ] && [[ "$REF_NAME" == ${TESTING//\*\*/*} ]]; then
+            PREFIX=${TESTING%%\**}; ENV=staging; VERSION=${REF_NAME#"$PREFIX"}
+          else echo "This branch is not the development branch ($DEV) or a release branch; no scan."; finish; fi
+          if skipped dependencies && skipped code && skipped secrets; then echo "All source scans are skipped in sdlc.yaml."; ENV=""; VERSION=""; finish; fi
+          # lanesync:skip-paths:begin
+          # scans.skip_paths: relative paths left out of the dependency and code scans (LaneSync validates them too;
+          # this file reads sdlc.yaml at run time, so each entry is checked again). At most 50.
+          N=0
+          while IFS= read -r P; do
+            [ -n "$P" ] || continue
+            P=${P%/}
+            if [ "${#P}" -le 200 ] && [[ "$P" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] && [[ "/$P/" != */./* && "/$P/" != */../* ]] && [ "$N" -lt 50 ]; then
+              case ",$SKIPPATHS," in *,"$P",*) ;; *) SKIPPATHS="${SKIPPATHS:+$SKIPPATHS,}$P"; N=$((N + 1)) ;; esac
+            else echo "::warning::Ignoring a scans.skip_paths entry that is not a relative path inside the repository"; fi
+          done < <(y '(.scans.skip_paths // [])[]')
+          [ -z "$SKIPPATHS" ] || echo "Left out of the dependency and code scans: ${SKIPPATHS//,/, }"
+          # lanesync:skip-paths:end
+          SOURCE=true; SUBJECT=$SHA
+          finish
+
+  scan:
+    name: Scan source
+    needs: plan
+    if: needs.plan.outputs.source == 'true'
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"ubuntu-latest"') }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out (read only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 200
+          fetch-tags: true
+
+      - name: Install scanners
+        shell: bash
+        env:
+          SKIP: ${{ needs.plan.outputs.skip }}
+        run: |
+          set -euo pipefail
+          BIN="$RUNNER_TEMP/lanesync-bin"; mkdir -p "$BIN"; echo "$BIN" >> "$GITHUB_PATH"
+          fetch() { local rc=0; curl -fsSL --retry 8 --retry-max-time 300 --proto '=https' -o "$3" "$1" || rc=$?; if [ "$rc" -ne 0 ]; then echo "::warning::could not download $1 (curl exit $rc)"; rm -f "$3"; return 1; fi; echo "$2  $3" | sha256sum -c --quiet - || { echo "::error::checksum mismatch for $1"; rm -f "$3"; return 1; }; }
+          case "$(uname -m)" in x86_64|amd64) A=x64 ;; aarch64|arm64) A=arm64 ;; *) echo "::error::LaneSync scans support x64 and arm64 Linux runners"; exit 1 ;; esac
+          pick() { local v="$1_$2"; echo "${!v}"; }
+          if [ "$A" = x64 ]; then JQA=amd64; TA=64bit; GA=x64; OA=x86; else JQA=arm64; TA=ARM64; GA=arm64; OA=aarch64; fi
+          fetch "https://github.com/jqlang/jq/releases/download/$JQ_VERSION/jq-linux-$JQA" "$(pick JQ_SHA256 "${A^^}")" "$BIN/jq" || exit 1
+          chmod +x "$BIN/jq"
+          case ",$SKIP," in *,dependencies,*) ;; *)
+            fetch "https://github.com/aquasecurity/trivy/releases/download/v$TRIVY_VERSION/trivy_${TRIVY_VERSION}_Linux-$TA.tar.gz" "$(pick TRIVY_SHA256 "${A^^}")" "$RUNNER_TEMP/trivy.tgz" \
+              && tar -xzf "$RUNNER_TEMP/trivy.tgz" -C "$BIN" trivy || echo "::warning::Trivy could not be installed; dependencies will be Not measured" ;; esac
+          case ",$SKIP," in *,code,*) ;; *)
+            LIBC=MANYLINUX; OL=manylinux; if ldd --version 2>&1 | grep -qi musl; then LIBC=MUSL; OL=musllinux; fi
+            fetch "https://github.com/opengrep/opengrep/releases/download/$OPENGREP_VERSION/opengrep_${OL}_$OA" "$(pick "OPENGREP_SHA256_$LIBC" "${A^^}")" "$BIN/opengrep" \
+              && chmod +x "$BIN/opengrep" || echo "::warning::Opengrep could not be installed; code scan will be Not measured" ;; esac
+          case ",$SKIP," in *,secrets,*) ;; *)
+            fetch "https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS_VERSION/gitleaks_${GITLEAKS_VERSION}_linux_$GA.tar.gz" "$(pick GITLEAKS_SHA256 "${A^^}")" "$RUNNER_TEMP/gitleaks.tgz" \
+              && tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$BIN" gitleaks || echo "::warning::gitleaks could not be installed; secrets will be Not measured" ;; esac
+
+      - name: Scan
+        shell: bash
+        env:
+          SKIP: ${{ needs.plan.outputs.skip }}
+          RELEASE_TAG_RE: ${{ needs.plan.outputs.release_tag_re }}
+          SKIP_PATHS: ${{ needs.plan.outputs.skip_paths }}
+        run: |
+          set -uo pipefail
+          OUT="$RUNNER_TEMP/lanesync-out"; rm -rf "$OUT"; mkdir -p "$OUT"
+          skipped() { case ",$SKIP," in *,"$1",*) return 0 ;; esac; return 1; }
+          IFS=',' read -ra SKIP_LIST <<< "${SKIP_PATHS:-}"
+          # lanesync:skip-sarif:begin
+          # Drops code findings located only under scans.skip_paths (the secret scan is never filtered).
+          skip_sarif() { jq --arg skip "${SKIP_PATHS:-}" '($skip | split(",") | map(select(. != ""))) as $p
+            | def gone: sub("^(file://)?(\\./)?"; "") as $u | any($p[]; . as $q | $u == $q or ($u | startswith($q + "/")));
+            (.runs[]?.results |= (if type == "array" then map(select(([.locations[]?.physicalLocation.artifactLocation.uri | strings] | length == 0)
+              or ([.locations[]?.physicalLocation.artifactLocation.uri | strings] | any(gone | not)))) else . end))' "$1" > "$2"; }
+          # lanesync:skip-sarif:end
+          # LaneSync never receives source code: drop every excerpt a SARIF report can carry.
+          clean_sarif() { jq 'walk(if type == "object" then del(.snippet, .contextRegion, .contents, .artifactChanges, .fixes) else . end)
+            | (.runs[]?.results[]?.ruleId |= (if type == "string" then sub("^.*?(?<id>lanesync\\.)"; "\(.id)") else . end))
+            | (.runs[]?.tool.driver.rules[]?.id |= (if type == "string" then sub("^.*?(?<id>lanesync\\.)"; "\(.id)") else . end))' "$1" > "$2"; }
+
+          if ! skipped dependencies && command -v trivy >/dev/null; then
+            # lanesync:dependency-scan:begin
+            # Every lockfile and manifest Trivy knows, in the whole tree (monorepos included), except scans.skip_paths.
+            TRIVY_ARGS=(--scanners vuln --format json --output "$OUT/trivy-raw.json" --cache-dir "$RUNNER_TEMP/trivy-cache"
+              --skip-version-check --quiet --timeout 20m --skip-dirs node_modules --skip-dirs .git)
+            for P in ${SKIP_LIST[@]+"${SKIP_LIST[@]}"}; do
+              if [ -f "$P" ]; then TRIVY_ARGS+=(--skip-files "$P"); else TRIVY_ARGS+=(--skip-dirs "$P"); fi
+            done
+            LOG="$RUNNER_TEMP/trivy-fs.log"; DEP_OK=false
+            if trivy fs "${TRIVY_ARGS[@]}" . > "$LOG" 2>&1; then DEP_OK=true
+            else
+              cat "$LOG"
+              # A package registry refused the requests (e.g. Maven Central's 429): one retry without registry calls.
+              # Lockfile ecosystems are scanned in full; Maven and Gradle dependencies may be incomplete, and the
+              # evidence says so. Any other failure stays Not measured.
+              if grep -qiE 'remote [a-z]+ repository|too many requests' "$LOG"; then
+                echo "::warning::A package registry refused the dependency scan's requests; scanning again offline (Maven and Gradle dependencies may be incomplete)"
+                rm -f "$OUT/trivy-raw.json"
+                if trivy fs "${TRIVY_ARGS[@]}" --offline-scan . > "$LOG" 2>&1; then DEP_OK=true
+                  jq -n '{mode: "offline", reason: "remote_repository_unavailable"}' > "$OUT/dependency-scope.json"
+                else cat "$LOG"; fi
+              fi
+            fi
+            if [ "$DEP_OK" = true ] && jq '{SchemaVersion, ArtifactName, Results: [.Results[]? | {Target, Class, Type, Vulnerabilities: [.Vulnerabilities[]? | {VulnerabilityID, PkgName, InstalledVersion, FixedVersion, Severity, Title, CVSS}]}]}' \
+                "$OUT/trivy-raw.json" > "$OUT/trivy-fs.json"; then echo dependencies >> "$OUT/measured"
+            else echo "::warning::The dependency scan did not complete; it is reported as Not measured"; rm -f "$OUT/trivy-fs.json" "$OUT/dependency-scope.json"; fi
+            rm -f "$OUT/trivy-raw.json" "$LOG"
+            # lanesync:dependency-scan:end
+          fi
+
+          if ! skipped code && command -v opengrep >/dev/null; then
+            RULES="$RUNNER_TEMP/lanesync-rules.yml"
+            if curl -fsSL --retry 3 --proto '=https' -o "$RULES" "${LANESYNC_API_URL%/}/api/ci/scans/rules/$LANESYNC_RULES_SHA256.yml" \
+               && echo "$LANESYNC_RULES_SHA256  $RULES" | sha256sum -c --quiet -; then
+              if opengrep scan --disable-version-check --quiet --timeout 10 --max-target-bytes 1000000 \
+                   -f "$RULES" --sarif-output="$OUT/opengrep-raw.sarif" . >/dev/null; then
+                if skip_sarif "$OUT/opengrep-raw.sarif" "$OUT/opengrep-kept.sarif" && clean_sarif "$OUT/opengrep-kept.sarif" "$OUT/opengrep.sarif"; then
+                  echo code >> "$OUT/measured"
+                else echo "::warning::The code scan report could not be read; it is reported as Not measured"; rm -f "$OUT/opengrep.sarif"; fi
+              else echo "::warning::The code scan did not complete; it is reported as Not measured"; fi
+              rm -f "$OUT/opengrep-raw.sarif" "$OUT/opengrep-kept.sarif"
+            else echo "::warning::The pinned LaneSync rule pack could not be fetched or did not match its checksum; the code scan is Not measured."; fi
+          fi
+
+          if ! skipped secrets && command -v gitleaks >/dev/null; then
+            # lanesync:secrets-range:begin
+            # Commits since the previous production release: the newest tag reachable from this commit that matches
+            # the release naming, is not a release-candidate tag (<release>-rc.N) and is not on this commit (so a
+            # candidate or release tagged here never empties the range). At most SECRETS_MAX_COMMITS commits.
+            HEAD_SHA=$(git rev-parse HEAD); BASE=""; BASE_SHA=""
+            TAG_RE=${RELEASE_TAG_RE:-}; [ -n "$TAG_RE" ] || TAG_RE='^v?[0-9]+\.[0-9]+\.[0-9]+$'
+            while IFS= read -r T; do
+              [ -n "$T" ] || continue
+              [[ "$T" =~ -rc\.[0-9]+$ ]] && continue
+              [[ "$T" =~ $TAG_RE ]] || continue
+              S=$(git rev-parse --verify --quiet "refs/tags/$T^{commit}") || continue
+              [ "$S" = "$HEAD_SHA" ] && continue
+              BASE=$T; BASE_SHA=$S; break
+            done < <(git for-each-ref --merged=HEAD --sort=-creatordate --format='%(refname:strip=2)' refs/tags)
+            if [ -n "$BASE" ]; then KIND=since_tag; RANGE="$BASE_SHA..$HEAD_SHA"; else KIND=last_commits; RANGE="$HEAD_SHA"; fi
+            COMMITS=$(git rev-list --count --max-count="$SECRETS_MAX_COMMITS" "$RANGE" 2>/dev/null || echo 0)
+            # lanesync:secrets-range:end
+            scope() { jq -n --arg k "$1" --arg t "$BASE" --arg b "$BASE_SHA" --arg h "$HEAD_SHA" --argjson c "$COMMITS" --argjson n "$SECRETS_MAX_COMMITS" \
+              '{kind: $k, max_commits: $n, head_sha: $h, commits: $c} + (if $t == "" then {} else {tag: $t, base_sha: $b} end)' > "$OUT/secret-scope.json"; }
+            if [ "$COMMITS" -eq 0 ]; then
+              # Nothing to scan is Not measured, never a clean result: no gitleaks report is uploaded.
+              echo "::notice::No commits to scan for secrets ($RANGE); secrets are Not measured (nothing to scan)"; scope nothing_to_scan
+            else
+              scope "$KIND"; echo "Secrets: $COMMITS commit(s) in $RANGE ($KIND${BASE:+ since $BASE})"
+              # --redact: secret values never leave the runner.
+              if gitleaks git --no-banner --redact --exit-code 0 --report-format sarif --report-path "$OUT/gitleaks-raw.sarif" --log-opts "--max-count=$SECRETS_MAX_COMMITS $RANGE" . ; then
+                clean_sarif "$OUT/gitleaks-raw.sarif" "$OUT/gitleaks.sarif" && echo secrets >> "$OUT/measured"
+              else echo "::warning::The secret scan did not complete; it is reported as Not measured"; rm -f "$OUT/secret-scope.json"; fi
+              rm -f "$OUT/gitleaks-raw.sarif"
+            fi
+          fi
+          echo "Measured: $(tr '\n' ' ' < "$OUT/measured" 2>/dev/null || echo none)"
+
+      - name: Build upload
+        shell: bash
+        env:
+          ENVIRONMENT: ${{ needs.plan.outputs.environment }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/lanesync-out"; P="$RUNNER_TEMP/lanesync-upload"; mkdir -p "$P"
+          entry() { [ -f "$1" ] && [ "$(wc -c < "$1")" -le 5000000 ] && jq -n --rawfile c "$1" --arg fn "$(basename "$1")" --arg fmt "$2" --arg cat "${3:-}" \
+            '{filename: $fn, content: $c, format: $fmt} + (if $cat == "" then {} else {category: $cat} end)' || true; }
+          { entry "$OUT/opengrep.sarif" sarif; entry "$OUT/gitleaks.sarif" sarif secrets; } | jq -s '.' > "$P/sast.json"
+          entry "$OUT/trivy-fs.json" trivy | jq -s '.' > "$P/cve.json"
+          SCOPE=$(cat "$OUT/secret-scope.json" 2>/dev/null || echo null)
+          # Set only when the dependency report came from the offline retry (a registry refused the requests).
+          DEPSCOPE=$( [ -f "$OUT/trivy-fs.json" ] && cat "$OUT/dependency-scope.json" 2>/dev/null || echo null)
+          jq -n --arg org "${GITHUB_REPOSITORY%%/*}" --arg repo "${GITHUB_REPOSITORY#*/}" --arg version "$VERSION" --arg env "$ENVIRONMENT" \
+            --arg run_id "$GITHUB_RUN_ID" --slurpfile sast "$P/sast.json" --slurpfile cve "$P/cve.json" --argjson scope "$SCOPE" \
+            --argjson depscope "$DEPSCOPE" --arg rp "$([ -f "$OUT/opengrep.sarif" ] && echo "$LANESYNC_RULES_SHA256")" \
+            '{org: $org, repo: $repo, version: $version, environment: $env, pipeline: "LaneSync scans", run_id: $run_id, metrics: {},
+              sast_files: $sast[0], cve_files: $cve[0]} + (if $scope == null then {} else {secret_scan_scope: $scope} end)
+              + (if $depscope == null then {} else {dependency_scan_scope: $depscope} end)
+              + (if $rp == "" then {} else {code_rule_pack: $rp} end)' \
+            | gzip -c > "$P/payload.json.gz"
+
+      - name: Keep results for upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lanesync-scans-payload
+          path: ${{ runner.temp }}/lanesync-upload/payload.json.gz
+          retention-days: 3
+          if-no-files-found: error
+
+  images:
+    name: Scan images
+    needs: plan
+    if: needs.plan.outputs.images == 'true'
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"ubuntu-latest"') }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Install Trivy
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$RUNNER_TEMP/lanesync-bin"; mkdir -p "$BIN"; echo "$BIN" >> "$GITHUB_PATH"
+          fetch() { local rc=0; curl -fsSL --retry 8 --retry-max-time 300 --proto '=https' -o "$3" "$1" || rc=$?; if [ "$rc" -ne 0 ]; then echo "::warning::could not download $1 (curl exit $rc)"; rm -f "$3"; return 1; fi; echo "$2  $3" | sha256sum -c --quiet - || { echo "::error::checksum mismatch for $1"; rm -f "$3"; return 1; }; }
+          case "$(uname -m)" in x86_64|amd64) JQA=amd64; TA=64bit; JS="$JQ_SHA256_X64"; TS="$TRIVY_SHA256_X64" ;;
+            aarch64|arm64) JQA=arm64; TA=ARM64; JS="$JQ_SHA256_ARM64"; TS="$TRIVY_SHA256_ARM64" ;; *) echo "::error::LaneSync scans support x64 and arm64 Linux runners"; exit 1 ;; esac
+          fetch "https://github.com/jqlang/jq/releases/download/$JQ_VERSION/jq-linux-$JQA" "$JS" "$BIN/jq" || exit 1
+          chmod +x "$BIN/jq"
+          fetch "https://github.com/aquasecurity/trivy/releases/download/v$TRIVY_VERSION/trivy_${TRIVY_VERSION}_Linux-$TA.tar.gz" "$TS" "$RUNNER_TEMP/trivy.tgz" || exit 1
+          tar -xzf "$RUNNER_TEMP/trivy.tgz" -C "$BIN" trivy
+
+      - name: Scan images by digest
+        shell: bash
+        env:
+          IMAGES: ${{ needs.plan.outputs.image_list }}
+          TAG: ${{ needs.plan.outputs.image_tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          OUT="$RUNNER_TEMP/lanesync-out"; rm -rf "$OUT"; mkdir -p "$OUT"; echo '[]' > "$OUT/images.json"
+          note() { jq --arg n "$1" --arg t "$TAG" --arg d "$2" --arg s "$3" --arg r "$4" \
+            '. + [{name: $n, tag: $t, digest: (if $d == "" then null else $d end), status: $s} + (if $r == "" then {} else {reason: $r} end)]' \
+            "$OUT/images.json" > "$OUT/images.tmp" && mv "$OUT/images.tmp" "$OUT/images.json"; }
+          ACCEPT='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+          i=0
+          for IMAGE in $IMAGES; do
+            i=$((i + 1))
+            case "$IMAGE" in ghcr.io/*) ;; *) echo "::notice::$IMAGE: registry not supported yet; Not measured"; note "$IMAGE" "" not_measured registry_not_supported; continue ;; esac
+            NAME=${IMAGE#ghcr.io/}
+            # Resolve the tag to its immutable digest, then scan exactly that digest.
+            # This workflow's token (packages: read); a public package also reads anonymously.
+            AUTH=token; TOKEN=$(curl -fs --proto '=https' -u "x-access-token:$GH_TOKEN" "https://ghcr.io/token?scope=repository:$NAME:pull" | jq -r '.token // empty') || TOKEN=""
+            if [ -z "$TOKEN" ]; then AUTH=anonymous; TOKEN=$(curl -fs --proto '=https' "https://ghcr.io/token?scope=repository:$NAME:pull" | jq -r '.token // empty') || TOKEN=""; fi
+            if [ -z "$TOKEN" ]; then echo "::warning::$IMAGE: GHCR could not be read (does this repository have read access to the package?)"; note "$IMAGE" "" not_measured registry_unavailable; continue; fi
+            echo "::add-mask::$TOKEN"
+            CODE=$(curl -sS --proto '=https' -o /dev/null -D "$OUT/headers" -w '%{http_code}' -I -H "Authorization: Bearer $TOKEN" -H "Accept: $ACCEPT" "https://ghcr.io/v2/$NAME/manifests/$TAG") || CODE=000
+            DIGEST=$(tr -d '\r' < "$OUT/headers" | awk -F': ' 'tolower($1) == "docker-content-digest" { print $2 }' | tail -1)
+            if [ "$CODE" = 404 ]; then echo "::warning::$IMAGE:$TAG not found"; note "$IMAGE" "" not_measured tag_not_found; continue; fi
+            if [ "$CODE" != 200 ] || ! [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then echo "::warning::$IMAGE:$TAG could not be resolved (HTTP $CODE)"; note "$IMAGE" "" not_measured registry_unavailable; continue; fi
+            if [ "$AUTH" = token ]; then export TRIVY_USERNAME=x-access-token TRIVY_PASSWORD="$GH_TOKEN"; else unset TRIVY_USERNAME TRIVY_PASSWORD; fi
+            if trivy image --image-src remote --scanners vuln --format json \
+                 --output "$OUT/raw.json" --cache-dir "$RUNNER_TEMP/trivy-cache" --skip-version-check --quiet --timeout 20m "$IMAGE@$DIGEST"; then
+              jq '{SchemaVersion, ArtifactName, Results: [.Results[]? | {Target, Class, Type, Vulnerabilities: [.Vulnerabilities[]? | {VulnerabilityID, PkgName, InstalledVersion, FixedVersion, Severity, Title, CVSS}]}]}' \
+                "$OUT/raw.json" > "$OUT/image-$i.json" && echo "$IMAGE" > "$OUT/image-$i.name" && note "$IMAGE" "$DIGEST" measured ""
+            else echo "::warning::$IMAGE@$DIGEST: the scan did not complete"; note "$IMAGE" "$DIGEST" not_measured scan_failed; fi
+            rm -f "$OUT/raw.json"
+          done
+
+      - name: Build upload
+        shell: bash
+        env:
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/lanesync-out"; P="$RUNNER_TEMP/lanesync-upload"; mkdir -p "$P"; echo '[]' > "$P/cve.json"
+          for f in "$OUT"/image-*.json; do
+            [ -f "$f" ] && [ "$(wc -c < "$f")" -le 5000000 ] || continue
+            jq --rawfile c "$f" --arg fn "$(basename "$f")" --arg t "image:$(cat "${f%.json}.name")" '. + [{filename: $fn, content: $c, format: "trivy", target: $t}]' \
+              "$P/cve.json" > "$P/cve.tmp" && mv "$P/cve.tmp" "$P/cve.json"
+          done
+          # The evidence is for the build run's commit: LaneSync reads it from GitHub using source_run_id.
+          jq -n --arg org "${GITHUB_REPOSITORY%%/*}" --arg repo "${GITHUB_REPOSITORY#*/}" --arg run_id "$GITHUB_RUN_ID" --arg src "$SOURCE_RUN_ID" \
+            --slurpfile cve "$P/cve.json" --slurpfile images "$OUT/images.json" \
+            '{org: $org, repo: $repo, version: "dev", environment: "dev", pipeline: "LaneSync image scan", run_id: $run_id,
+              source_run_id: $src, metrics: {}, cve_files: $cve[0], image_scans: $images[0]}' | gzip -c > "$P/payload.json.gz"
+
+      - name: Keep results for upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lanesync-scans-payload
+          path: ${{ runner.temp }}/lanesync-upload/payload.json.gz
+          retention-days: 3
+          if-no-files-found: error
+
+  upload:
+    name: Upload to LaneSync
+    needs: [plan, scan, images]
+    if: always() && (needs.scan.result == 'success' || needs.images.result == 'success')
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"ubuntu-latest"') }}
+    timeout-minutes: 10
+    # The only job that can request an OIDC token. It never checks out or runs repository content.
+    permissions:
+      id-token: write
+    steps:
+      - name: Fetch results
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lanesync-scans-payload
+          path: ${{ runner.temp }}/lanesync-upload
+
+      - name: Upload
+        shell: bash
+        env:
+          SUBJECT_SHA: ${{ needs.plan.outputs.subject_sha }}
+        run: |
+          set -uo pipefail
+          PAYLOAD="$RUNNER_TEMP/lanesync-upload/payload.json.gz"
+          [ -f "$PAYLOAD" ] || { echo "::warning::No scan results to upload"; exit 0; }
+          RESP=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=lanesync") || RESP=""
+          TOKEN=$(printf '%s' "$RESP" | sed -n 's/.*"value"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+          # Without a token nothing reaches LaneSync: red, so the results are never lost behind a green run (#590).
+          [ -n "$TOKEN" ] || { echo "::error::GitHub OIDC token request failed, so the results were not uploaded. The upload job needs permissions: id-token: write."; exit 1; }
+          echo "::add-mask::$TOKEN"
+          BODY="$RUNNER_TEMP/lanesync-upload/response.json"
+          for attempt in 1 2 3; do
+            CODE=$(curl --silent --show-error --output "$BODY" --write-out '%{http_code}' --connect-timeout 10 --max-time 120 \
+              -X POST "${LANESYNC_API_URL%/}/api/evidence/upload" -H "Content-Type: application/json" -H "Content-Encoding: gzip" \
+              -H "Authorization: Bearer $TOKEN" --data-binary "@$PAYLOAD") || CODE=000
+            if [[ "$CODE" == 2* ]]; then echo "Uploaded to LaneSync."; exit 0; fi
+            # The one green rejection: LaneSync has no open release to file the results under (between releases).
+            # Only its machine code counts, never another 404 such as "Is the GitHub App installed?" (#590).
+            if [[ "$CODE" == 404 ]] && grep -q '"code"[[:space:]]*:[[:space:]]*"no_open_release"' "$BODY"; then
+              echo "::warning::No open release in LaneSync; results for ${SUBJECT_SHA:0:7} were not kept. If a release pins this commit, re-run this workflow."
+              exit 0
+            fi
+            # Any other rejection is red with LaneSync's reason; the same request would get the same answer.
+            if [[ "$CODE" != 000 && "$CODE" != 429 && "$CODE" != 5* ]]; then echo "::error::LaneSync rejected the upload (HTTP $CODE): $(head -c 500 "$BODY")"; exit 1; fi
+            [ "$attempt" -lt 3 ] && sleep $((attempt * 10))
+          done
+          # A retryable failure (LaneSync or GitHub unavailable) fails the job, so the results are not dropped
+          # silently: re-run this workflow to upload them (the build stays bound by its image tag).
+          echo "::error::The upload to LaneSync failed after 3 attempts (HTTP $CODE); re-run this workflow to upload the results"
+          exit 1
